@@ -53,21 +53,24 @@ use the LoRa concentrator:
 For an standard application, include only this module.
 The use of this module is detailed on the usage section.
 
-/!\ When sending a packet, there is a 1.5 ms delay for the analog circuitry to
-start and be stable (TX_START_DELAY).
+/!\ When sending a packet, there is a delay (approx 1.5ms) for the analog
+circuitry to start and be stable. This delay is adjusted by the HAL depending
+on the board version (lgw_i_tx_start_delay_us).
 
-In 'timestamp' mode, this is transparent: the modem is started 1.5ms before the
-user-set timestamp value is reached, the preamble of the packet start right when
-the internal timestamp counter reach target value.
+In 'timestamp' mode, this is transparent: the modem is started
+lgw_i_tx_start_delay_us microseconds before the user-set timestamp value is
+reached, the preamble of the packet start right when the internal timestamp
+counter reach target value.
 
 In 'immediate' mode, the packet is emitted as soon as possible: transferring the
 packet (and its parameters) from the host to the concentrator takes some time,
-then there is the TX_START_DELAY, then the packet is emitted.
+then there is the lgw_i_tx_start_delay_us, then the packet is emitted.
 
-In 'triggered' mode (aka PPS/GPS mode), the packet, typically a beacon, is 
-emitted 1.5ms after a rising edge of the trigger signal. Because there is no
-way to anticipate the triggering event and start the analog circuitry
-beforehand, that delay must be taken into account in the protocol.
+In 'triggered' mode (aka PPS/GPS mode), the packet, typically a beacon, is
+emitted lgw_i_tx_start_delay_us microsenconds after a rising edge of the
+trigger signal. Because there is no way to anticipate the triggering event and
+start the analog circuitry beforehand, that delay must be taken into account in
+the protocol.
 
 ### 2.2. loragw_reg ###
 
@@ -143,25 +146,28 @@ The internal concentrator counter is used to timestamp incoming packets and to
 triggers outgoing packets with a microsecond accuracy.
 In some cases, it might be useful to be able to transform that internal 
 timestamp (that is independent for each concentrator running in a typical 
-networked system) into an absolute UTC time.
+networked system) into an absolute GPS time.
 
 In a typical implementation a GPS specific thread will be called, doing the
 following things after opening the serial port:
 
 * blocking reads on the serial port (using system read() function)
-* parse NMEA sentences (using lgw_parse_nmea)
+* parse UBX messages (using lgw_parse_ubx) to get actual native GPS time
+* parse NMEA sentences (using lgw_parse_nmea) to get location and UTC time
+Note: the RMC sentence gives UTC time, not native GPS time.
 
-And each time an RMC sentence has been received:
+And each time an NAV-TIMEGPS UBX message has been received:
 
 * get the concentrator timestamp (using lgw_get_trigcnt, mutex needed to 
   protect access to the concentrator)
-* get the UTC time contained in the NMEA sentence (using lgw_gps_get)
+* get the GPS time contained in the UBX message (using lgw_gps_get)
 * call the lgw_gps_sync function (use mutex to protect the time reference that 
   should be a global shared variable).
 
 Then, in other threads, you can simply used that continuously adjusted time 
-reference to convert internal timestamps to UTC time (using lgw_cnt2utc) or 
-the other way around (using lgw_utc2cnt).
+reference to convert internal timestamps to GPS time (using lgw_cnt2gps) or
+the other way around (using lgw_gps2cnt). Inernal concentrator timestamp can
+also be converted to/from UTC time using lgw_cnt2utc/lgw_utc2cnt functions.
 
 ### 2.6. loragw_radio ###
 
@@ -178,78 +184,70 @@ This module is only required for SX1301AP2 reference design.
 ### 2.8. loragw_lbt ###
 
 This module contains functions to configure and use the "Listen-Before-Talk"
-feature. It depends on the loragw_fpga and loragw_radio modules.
+feature (refered as LBT below). It depends on the loragw_fpga and loragw_radio
+modules.
 
 LBT feature is only available on SX1301AP2 reference design, which provides the
 FPGA and the SX127x radio required to accomplish the feature.
 
-The FPGA implements the following Finite State Machine (FSM) to scan predefined
-channels used for LBT, using the SX127x radio:
+The FPGA implements the following Finite State Machine (FSM) to scan the defined
+LBT channels (8 max), and also compute the RSSI histogram for spectral scan,
+using the SX127x radio.
 
 
                           +-------+
-                          | idle  |
-                          +-------+
-                              |
-                              v
-                         +---------+
-                         | set pll |<----+
-                         +---------+     |
-                              |          |
-                              v          |
-                         +----------+    |
-                         | wait pll |    |
-                         |   lock   |    |
-                         +----------+    |
-                              |          |
-                              v          |
-                        +-----------+    |
-                    +-->| read rssi |    |
-                    |   +-----------+    |
-      The number of |         |          |
-   read defines the |         v          | The delay between 2 channel
-  CHANNEL_SCAN_TIME |   +------------+   | scan is equal to
-                    |   | compare to |   | PLL_LOCK_TIME + CHANNEL_SCAN_TIME
-                    +---+            |   |
-                        | threshold  |   |
-                        +------------+   |
-                              |          |
-                              v          |
-                        +------------+   |
-                        | update CH_n|   |
-                        |  timestamp |   |
-                        +----------- +   |
-                              |          |
-                              v          |
-                        +-----------+    |
-                        |   update  |    |
-                        |  rf freq  |    |
-                        +-----+-----+    |
-                              |          |
-                              +----------+
+      +------------------>+ idle  +------------------+
+      |                   +-------+                  v
+      |                       |                +-----------+
+      |                       |                | clean mem |
+      |                       v                +-----------+
+      |                  +----------+                |
+      |                  | set freq |<---------------+
+      |                  +----------+
+      |                       |
+      |                       v
+      |                  +----------+
+      |                  | wait pll |
+      |                  |   lock   |
+      |                  +----------+
+      |                       |                (SCAN_CHANNEL)
+      |                       v                +-----------+
+      |                 +-----------+          |           |
+      |                 |           +----------+           v
+      |             +-->| read RSSI |                +------------+
+      |             |   |           +<---------------+ calc histo |
+      |             |   +-----------+   SCANNING     +------------+
+      |             |         |                            |
+      |    SCANNING |         | (LBT_CHANNEL)              |
+      |             |         v                            |
+      |             |  +-------------+                     |
+      |             |  |   compare   |                     |
+      |             +--+     with    |                     |
+      |                | RSSI_TARGET |          HISTO_DONE |
+      |                +-------------+                     |
+      |                       |                            |
+      |             SCAN DONE |                            |
+      |                       v                            |
+      |                 +------------+                     |
+      |                 |  increase  |                     |
+      +-----------------+            +<--------------------+
+                        |    freq    |
+                        +------------+
+
+
 
 In order to configure the LBT, the following parameters have to be set:
-
-SPI_MASTER_SPEED_DIVIDER: defines the internal SPI_MASTER SPI clock speed.
-                          SPI_clock_freq = 32MHz / (SPI_MASTER_SPEED_DIVIDER*2)
-
-NB_RSSI_READ:             defines the number of SPI reads of SX127x RSSI value
-                          register.
-
-PLL_LOCK_TIME:            defines the delay in 8µs step between frequency
-                          programming and RX ready.
-
-RSSI_TARGET:              defines the signal strength target used to detect if
-                          the channel is busy or not.
-                          RSSI_TARGET_dBm = -RSSI_TARGET / 2
-
-Based on those parameters we have:
-
-CHANNEL_SCAN_TIME (µs) = (NB_RSSI_READ + 1) * Tspi
-    with Tspi (µs) = (16*(2*(SPI_MASTER_SPEED_DIVIDER+1))/32) + 2
+- RSSI_TARGET: signal strength target used to detect if the channel is clear
+               or not.
+               RSSI_TARGET_dBm = -RSSI_TARGET/2
+- LBT_CHx_FREQ_OFFSET: with x=[0..7], offset from the predefined LBT start
+                       frequency (863MHz or 915MHz depending on FPGA image),
+                       in 100KHz unit.
+- LBT_SCAN_TIME_CHx: with x=[0..7], the channel scan time to be used for this
+                     LBT channel: 128µs or 5000µs
 
 With this FSM, the FPGA keeps the last instant when each channel was free during
-more than CHANNEL_SCAN_TIME µs.
+more than LBT_SCAN_TIME_CHx µs.
 
 Then, the HAL, when receiving a downlink request, will first determine on which
 LBT channel this downlink is supposed to be sent and then checks if the channel
@@ -266,8 +264,7 @@ In order to determine if a downlink is allowed or not, the HAL does:
     ALLOWED = FALSE
   endif
     where TX_MAX_TIME is the maximum time allowed to send a packet since the
-    last channel free time (this is given to the HAL as a configuration
-    parameter).
+    last channel free time (this depends on the channel scan time ).
 
 
 3. Software build process
@@ -361,20 +358,13 @@ sudo to run all your programs (eg. `sudo ./test_loragw_gps`).
 
 In the current revision, the library only reads data from the serial port, 
 expecting to receive NMEA frames that are generally sent by GPS receivers as 
-soon as they are powered up.
+soon as they are powered up, and UBX messages which are proprietary to u-blox
+modules.
 
-The GPS receiver **MUST** send RMC NMEA sentences (starting with "$G<any 
-character>RMC") shortly after sending a PPS pulse on to allow internal 
-concentrator timestamps to be converted to absolute UTC time.
-If the GPS receiver sends a GGA sentence, the gateway 3D position will also be 
-available.
-
-The PPS pulse must be sent to the pin 22 of connector CONN400 on the Semtech 
-FPGA-based nano-concentrator board. Ground is available on pins 2 and 12 of 
-the same connector.
-The pin is loaded by an FPGA internal pull-down, and the signal level coming 
-in the FPGA must be 3.3V.
-Timing is captured on the rising edge of the PPS signal.
+The GPS receiver **MUST** send UBX messages shortly after sending a PPS pulse
+on to allow internal concentrator timestamps to be converted to absolute GPS time.
+If the GPS receiver sends a GGA NMEA sentence, the gateway 3D position will
+also be available.
 
 5. Usage
 --------
